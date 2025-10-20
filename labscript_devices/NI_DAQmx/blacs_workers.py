@@ -10,6 +10,7 @@
 # file in the root of the project for the full license.             #
 #                                                                   #
 #####################################################################
+import json
 import sys
 import time
 import threading
@@ -34,6 +35,8 @@ from blacs.tab_base_classes import Worker
 from .utils import split_conn_port, split_conn_DO, split_conn_AI
 from .daqmx_utils import incomplete_sample_detection
 
+import zmq
+from labscript_utils.ls_zprocess import Context
 
 class NI_DAQmxOutputWorker(Worker):
     def init(self):
@@ -135,6 +138,8 @@ class NI_DAQmxOutputWorker(Worker):
         # TODO: return coerced/quantised values
         return {}
 
+    # TODO:OPT: Not opening the file in the experiment queue significantly speeds up the file query time
+    # need to figure out why...
     def get_output_tables(self, h5file, device_name):
         """Return the AO and DO tables rom the file, or None if they do not exist."""
         with h5py.File(h5file, 'r') as hdf5_file:
@@ -354,11 +359,9 @@ class NI_DAQmxOutputWorker(Worker):
             final_values[self.wait_timeout_connection] = self.wait_timeout_rearm_value
 
         return final_values
-
-    def transition_to_manual(self, abort=False):
-        # Stop output tasks and call program_manual. Only call StopTask if not aborting.
-        # Otherwise results in an error if output was incomplete. If aborting, call
-        # ClearTask only.
+    
+    def post_experiment(self):
+        # Stop output tasks
         npts = uInt64()
         samples = uInt64()
         tasks = []
@@ -370,23 +373,22 @@ class NI_DAQmxOutputWorker(Worker):
             self.DO_task = None
 
         for task, static, name in tasks:
-            if not abort:
-                if not static:
-                    try:
-                        # Wait for task completion with a 1 second timeout:
-                        task.WaitUntilTaskDone(1)
-                    finally:
-                        # Log where we were up to in sample generation, regardless of
-                        # whether the above succeeded:
-                        task.GetWriteCurrWritePos(npts)
-                        task.GetWriteTotalSampPerChanGenerated(samples)
-                        # Detect -1 even though they're supposed to be unsigned ints, -1
-                        # seems to indicate the task was not started:
-                        current = samples.value if samples.value != 2 ** 64 - 1 else -1
-                        total = npts.value if npts.value != 2 ** 64 - 1 else -1
-                        msg = 'Stopping %s at sample %d of %d'
-                        self.logger.info(msg, name, current, total)
-                task.StopTask()
+            if not static:
+                try:
+                    # Wait for task completion with a 1 second timeout:
+                    task.WaitUntilTaskDone(1)
+                finally:
+                    # Log where we were up to in sample generation, regardless of
+                    # whether the above succeeded:
+                    task.GetWriteCurrWritePos(npts)
+                    task.GetWriteTotalSampPerChanGenerated(samples)
+                    # Detect -1 even though they're supposed to be unsigned ints, -1
+                    # seems to indicate the task was not started:
+                    current = samples.value if samples.value != 2 ** 64 - 1 else -1
+                    total = npts.value if npts.value != 2 ** 64 - 1 else -1
+                    msg = 'Stopping %s at sample %d of %d'
+                    self.logger.info(msg, name, current, total)
+            task.StopTask()
             task.ClearTask()
 
         # Remove the mirroring of the clock terminal, if applicable:
@@ -395,6 +397,26 @@ class NI_DAQmxOutputWorker(Worker):
         # Remove connections between other terminals, if applicable:
         self.set_connected_terminals_connected(False)
 
+        return True
+    
+    def transition_to_manual(self, abort=False):
+        # If aborting, stop output tasks. And program device to manual
+        if abort:
+            # We did not call transition_to_manual from post_experiment, stop output 
+            # task accordingly
+            npts = uInt64()
+            samples = uInt64()
+            tasks = []
+            if self.AO_task is not None:
+                tasks.append([self.AO_task, self.static_AO or self.AO_all_zero, 'AO'])
+                self.AO_task = None
+            if self.DO_task is not None:
+                tasks.append([self.DO_task, self.static_DO or self.DO_all_zero, 'DO'])
+                self.DO_task = None
+
+            for task, _, _ in tasks:
+                task.ClearTask()
+        
         # Set up manual mode tasks again:
         self.start_manual_mode_tasks()
         if abort:
@@ -412,9 +434,15 @@ class NI_DAQmxOutputWorker(Worker):
 
 class NI_DAQmxAcquisitionWorker(Worker):
     MAX_READ_INTERVAL = 0.2
-    MAX_READ_PTS = 10000
+    MAX_READ_PTS = 1000
 
     def init(self):
+        # Create the socket to communicate with the DataReceiver for Plotting
+        self.data_socket = Context().socket(zmq.REQ)
+        self.data_socket.connect(
+            f'tcp://{self.parent_host}:{self.data_receiver_port}'
+        )
+
         # Prevent interference between the read callback and the shutdown code:
         self.tasklock = threading.RLock()
 
@@ -433,13 +461,14 @@ class NI_DAQmxAcquisitionWorker(Worker):
         # and disable inputs in manual mode, and adjust the rate:
         self.manual_mode_chans = self.AI_chans
         self.manual_mode_rate = 1000
+        self.manual_mode_task = False
 
         # An event for knowing when the wait durations are known, so that we may use
         # them to chunk up acquisition data:
         self.wait_durations_analysed = Event('wait_durations_analysed')
 
         # Start task for manual mode
-        self.start_task(self.manual_mode_chans, self.manual_mode_rate)
+        self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
 
     def shutdown(self):
         if self.task is not None:
@@ -465,12 +494,19 @@ class NI_DAQmxAcquisitionWorker(Worker):
             )
             # Select only the data read, and downconvert to 32 bit:
             data = self.read_array[: int(samples_read.value), :].astype(np.float32)
+            # TODO: add the plot data network communication here, can send data directly with no need to serialize
             if self.buffered_mode:
                 # Append to the list of acquired data:
                 self.acquired_data.append(data)
             else:
                 # TODO: Send it to the broker thingy.
-                pass
+                # TODO: is pickling the list more efficient than numpy/json?
+                # prepend data packet with the channels to unpack from raw_data_buffer
+                manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
+
+                self.data_socket.send_multipart([manual_chans_json, data])
+                response = self.data_socket.recv()
+                assert response == b'ok', response
         return 0
 
     def start_task(self, chans, rate):
@@ -536,12 +572,14 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
         self.task.StartTask()
 
+        return True
+
     def stop_task(self):
         with self.tasklock:
             if self.task is None:
                 raise RuntimeError('Task not running')
             # Read remaining data:
-            self.read(self.task, None, -1)
+            self.read(self.task.taskHandle.value, None, -1)
             # Stop the task:
             self.task.StopTask()
             self.task.ClearTask()
@@ -570,32 +608,45 @@ class NI_DAQmxAcquisitionWorker(Worker):
             # delay is defined in sample clock ticks, calculate in sec and save for later
             self.AI_start_delay = self.AI_start_delay_ticks*self.buffered_rate
         self.acquired_data = []
-        # Stop the manual mode task and start the buffered mode task:
-        self.stop_task()
+        
+        # Configure the Buffered Mode Real Time Plotting
+        shot_length = device_properties.get('stop_time', None)
+        acq_points_per_chan = np.array([int(shot_length * self.buffered_rate)]).tobytes()
+
+        buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
+
+        self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
+        response = self.data_socket.recv()
+        assert response == b'ok', response
+
+        # Stop the manual mode task if it is running and start the buffered mode task:
+        if self.manual_mode_task:
+            self.stop_task()
         self.buffered_mode = True
         self.start_task(self.buffered_chans, self.buffered_rate)
         return {}
 
-    def transition_to_manual(self, abort=False):
-        self.logger.debug('transition_to_manual')
-        #  If we were doing buffered mode acquisition, stop the buffered mode task and
-        # start the manual mode task. We might not have been doing buffered mode
-        # acquisition if abort() was called when we are not in buffered mode, or if
+    def post_experiment(self):
+        self.logger.debug('post_experiment processing')
+        # If we were doing buffered mode acquisition, stop the buffered mode task. 
+        # We might not have been doing buffered mode acquisition if
         # there were no acuisitions this shot.
         if not self.buffered_mode:
             return True
         if self.buffered_chans is not None:
             self.stop_task()
-        self.buffered_mode = False
-        self.logger.info('transitioning to manual mode, task stopped')
-        self.start_task(self.manual_mode_chans, self.manual_mode_rate)
 
-        if abort:
-            self.acquired_data = None
-            self.buffered_chans = None
-            self.h5_file = None
-            self.buffered_rate = None
-            return True
+            # TODO: is pickling the list more efficient than numpy/json?
+            raw_data_buffer = np.concatenate(self.acquired_data).tobytes()
+            # prepend data packet with the channels to unpack from raw_data_buffer
+            buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
+
+            self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
+            response = self.data_socket.recv()
+            assert response == b'ok', response
+
+        self.buffered_mode = False
+        self.logger.info('processing acquired data, task stopped')
 
         with h5py.File(self.h5_file, 'a') as hdf5_file:
             data_group = hdf5_file['data']
@@ -622,6 +673,41 @@ class NI_DAQmxAcquisitionWorker(Worker):
         else:
             msg = 'No acquisitions in this shot.'
         self.logger.info(msg)
+
+        self.manual_mode_task = False
+
+        return True
+
+    def transition_to_manual(self, abort=False):
+        self.logger.debug('transition_to_manual')
+        # Handle abort calls, and start manual mode task 
+        if abort:
+            if not self.buffered_mode:
+                return True
+            if self.buffered_chans is not None:
+                self.stop_task()
+            self.buffered_mode = False
+            self.logger.info('transitioning to manual mode, task stopped')
+            self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
+            self.manual_mode_task
+            self.acquired_data = None
+            self.buffered_chans = None
+            self.h5_file = None
+            self.buffered_rate = None
+        else:
+            self.logger.info('transitioning to manual mode')
+            
+            # Configure the Manual Mode Real-Time Plotting
+            max_manual_mode_points = np.array([int(10000)]).tobytes() # TODO: set a proper value
+            
+            manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
+            
+            self.data_socket.send_multipart([b'max_plot_points', manual_chans_json, max_manual_mode_points])
+            response = self.data_socket.recv()
+            assert response == b'ok', response
+
+            if not self.task:
+                self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
 
         return True
 
@@ -928,10 +1014,11 @@ class NI_DAQmxWaitMonitorWorker(Worker):
 
         return {}
 
-    def transition_to_manual(self, abort=False):
-        self.logger.debug('transition_to_manual')
-        self.stop_tasks(abort)
-        if not abort and self.wait_table is not None:
+    def post_experiment(self):
+        self.logger.debug('post_experiment processing')
+        self.stop_tasks(False)
+        
+        if self.wait_table is not None:
             # Let's work out how long the waits were. The absolute times of each edge on
             # the wait monitor were:
             edge_times = np.cumsum(self.semiperiods)
@@ -971,6 +1058,14 @@ class NI_DAQmxWaitMonitorWorker(Worker):
 
         self.h5_file = None
         self.semiperiods = None
+        return True
+    
+    def transition_to_manual(self, abort=False):
+        self.logger.debug('transition_to_manual')
+        if (abort):
+            self.stop_tasks(abort)
+            self.h5_file = None
+            self.semiperiods = None
         return True
 
     def abort_buffered(self):

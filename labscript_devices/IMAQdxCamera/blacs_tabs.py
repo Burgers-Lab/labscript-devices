@@ -22,7 +22,7 @@ import h5py
 
 import numpy as np
 
-from qtutils import UiLoader, inmain_decorator
+from qtutils import UiLoader, inmain_decorator, qtlock
 import qtutils.icons
 from qtutils.qt import QtWidgets, QtGui, QtCore
 import pyqtgraph as pg
@@ -217,14 +217,20 @@ class IMAQdxCameraTab(DeviceTab):
 
     @define_state(MODE_MANUAL, queue_state_indefinitely=True, delete_stale_states=True)
     def update_attributes(self):
+        with qtlock:
+            current_text = self.attributes_dialog.comboBox.currentText()
         attributes_text = yield (
             self.queue_work(
                 self.primary_worker,
                 'get_attributes_as_text',
-                self.attributes_dialog.comboBox.currentText(),
+                current_text,
             )
         )
-        self.attributes_dialog.plainTextEdit.setPlainText(attributes_text)
+        self.update_text_slot(attributes_text)
+    
+    @inmain_decorator()
+    def update_text_slot(self, text):
+        self.attributes_dialog.plainTextEdit.setPlainText(text)
 
     def on_attributes_clicked(self, button):
         self.attributes_dialog.show()
@@ -261,7 +267,7 @@ class IMAQdxCameraTab(DeviceTab):
 
     def on_copy_clicked(self, button):
         text = self.attributes_dialog.plainTextEdit.toPlainText()
-        clipboard = QtGui.QApplication.instance().clipboard()
+        clipboard = QtWidgets.QApplication.instance().clipboard()
         clipboard.setText(text)
 
     def on_reset_rate_clicked(self):
