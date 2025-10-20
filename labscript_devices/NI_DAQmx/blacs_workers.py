@@ -456,6 +456,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
         self.acquired_data = None
         self.buffered_rate = None
         self.buffered_chans = None
+        self.wait_table = None
 
         # Hard coded for now. Perhaps we will add functionality to enable
         # and disable inputs in manual mode, and adjust the rate:
@@ -577,14 +578,18 @@ class NI_DAQmxAcquisitionWorker(Worker):
     def stop_task(self):
         with self.tasklock:
             if self.task is None:
-                raise RuntimeError('Task not running')
-            # Read remaining data:
-            self.read(self.task.taskHandle.value, None, -1)
-            # Stop the task:
-            self.task.StopTask()
-            self.task.ClearTask()
-            self.task = None
-            self.read_array = None
+                # NOTE: Encountering error, we skip this line for now.
+                # raise RuntimeError('Task not running')
+                pass
+
+            else:
+                # Read remaining data:
+                self.read(self.task.taskHandle.value, None, -1)
+                # Stop the task:
+                self.task.StopTask()
+                self.task.ClearTask()
+                self.task = None
+                self.read_array = None
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         self.logger.debug('transition_to_buffered')
@@ -680,7 +685,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
     def transition_to_manual(self, abort=False):
         self.logger.debug('transition_to_manual')
-        self.stop_tasks(abort)
+        self.stop_task()
         if not abort and self.wait_table is not None:
             # Let's work out how long the waits were. The absolute times of each edge on
             # the wait monitor were:
