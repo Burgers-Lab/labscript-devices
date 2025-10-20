@@ -11,14 +11,60 @@
 #                                                                   #
 #####################################################################
 import labscript_utils.h5_lock
-import h5py
 from labscript_utils import dedent
+import h5py
+import json
+import numpy as np
 
 from blacs.device_base_class import DeviceTab
-from .utils import split_conn_AO, split_conn_DO
+from labscript_utils.qtwidgets.InputPlotWindow import PlotWindow
+from labscript_utils.qtwidgets.analoginput import AnalogInput
+from labscript_utils.ls_zprocess import ZMQServer
+from .utils import split_conn_AO, split_conn_AI, split_conn_DO
+from qtutils import UiLoader, inmain_decorator
 from . import models
 import warnings
 
+# TODO: ideas for plotting layout:
+#   - all the plots in a single window, stacked on top of each other.
+#   - all signals on a single plot, different colour traces
+# will require changes to labscript_utils.qtwidgets.analoginput.{AnalogInput, InputPlotWindow}
+class DataReceiver(ZMQServer):
+    """ZMQServer that receives images on a zmq.REP socket, replies 'ok', and updates the
+    image widget and fps indicator"""
+
+    def __init__(self, buttons, logger):
+        ZMQServer.__init__(self, port=None, dtype='multipart')
+        self.buttons = buttons
+        self.last_frame_time = None
+        self.frame_rate = None
+        self.update_event = None
+        self.logger=logger
+
+    @inmain_decorator(wait_for_return=True)
+    def handler(self, data):
+        self.send([b'ok'])
+
+        if (data[0] == b'max_plot_points'):
+            chans = json.loads(data[1].decode('utf-8'))
+            data = np.frombuffer(memoryview(data[2]), dtype=int)[0]
+            self.logger.debug(f"test: {data}, {chans}")
+            for i, chan in enumerate(chans):
+                self.buttons[chan].set_max_data(data)
+            return self.NO_RESPONSE
+        else:
+            chans = json.loads(data[0].decode('utf-8'))
+            num_chans = len(chans)
+            data = np.frombuffer(memoryview(data[1]), dtype=np.float32)
+        
+            # break up the plot data to separate out each of the channels data
+            split_data = [data[i::num_chans] for i in range(num_chans)]
+
+            # the AnalogInput button uses IPC (pipes) to communicate with the plot window Process
+            for i, chan in enumerate(chans):
+                self.buttons[chan].set_buffer(split_data[i])
+
+            return self.NO_RESPONSE
 
 class NI_DAQmxTab(DeviceTab):
     def initialise_GUI(self):
@@ -125,7 +171,20 @@ class NI_DAQmxTab(DeviceTab):
             else:
                 name += ' (static)'
             widget_list.append((name, DO_widgets, split_conn_DO))
+        
+        self.ai_buttons = {}
+        for i, chan in enumerate(AI_chans):
+            child_device = self.get_child_from_connection_table(self.device_name,chan)
+            conn_name = child_device.name if child_device else '-'
+            ai_button = AnalogInput(self.device_name, chan, conn_name)
+            ai_button.set_value(0)
+            self.ai_buttons[chan] = ai_button
+
+        widget_list.append(("Analog Inputs", self.ai_buttons, split_conn_AI))
+
         self.auto_place_widgets(*widget_list)
+
+        self.data_receiver = DataReceiver(self.ai_buttons, self.logger)
 
         # We only need a wait monitor worker if we are if fact the device with
         # the wait monitor input.
@@ -209,6 +268,7 @@ class NI_DAQmxTab(DeviceTab):
                     'AI_timebase_terminal': properties.get('AI_timebase_terminal',None),
                     'AI_timebase_rate': properties.get('AI_timebase_rate',None),
                     'clock_terminal': clock_terminal,
+                    'data_receiver_port': self.data_receiver.port,
                 },
             )
             self.add_secondary_worker("acquisition_worker")
