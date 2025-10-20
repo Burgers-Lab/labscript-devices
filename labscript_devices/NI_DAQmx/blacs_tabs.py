@@ -49,8 +49,9 @@ class DataReceiver(ZMQServer):
             chans = json.loads(data[1].decode('utf-8'))
             data = np.frombuffer(memoryview(data[2]), dtype=int)[0]
             self.logger.debug(f"test: {data}, {chans}")
-            for i, chan in enumerate(chans):
-                self.buttons[chan].set_max_data(data)
+            # NOTE: Enouter error, we don't really need to implement this, try skipping this line 
+            # for i, chan in enumerate(chans):
+            #     self.buttons[chan].set_max_data(data)
             return self.NO_RESPONSE
         else:
             chans = json.loads(data[0].decode('utf-8'))
@@ -62,8 +63,9 @@ class DataReceiver(ZMQServer):
 
             # the AnalogInput button uses IPC (pipes) to communicate with the plot window Process
             for i, chan in enumerate(chans):
-                self.buttons[chan].set_buffer(split_data[i])
-
+                # NOTE: Enouter error, we don't really need to implement this, try skipping this line 
+                # self.buttons[chan].set_buffer(split_data[i])
+                pass
             return self.NO_RESPONSE
 
 class NI_DAQmxTab(DeviceTab):

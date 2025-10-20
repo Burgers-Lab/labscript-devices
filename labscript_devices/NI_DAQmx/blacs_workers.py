@@ -680,35 +680,45 @@ class NI_DAQmxAcquisitionWorker(Worker):
 
     def transition_to_manual(self, abort=False):
         self.logger.debug('transition_to_manual')
-        # Handle abort calls, and start manual mode task 
-        if abort:
-            if not self.buffered_mode:
-                return True
-            if self.buffered_chans is not None:
-                self.stop_task()
-            self.buffered_mode = False
-            self.logger.info('transitioning to manual mode, task stopped')
-            self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
-            self.manual_mode_task
-            self.acquired_data = None
-            self.buffered_chans = None
-            self.h5_file = None
-            self.buffered_rate = None
-        else:
-            self.logger.info('transitioning to manual mode')
-            
-            # Configure the Manual Mode Real-Time Plotting
-            max_manual_mode_points = np.array([int(10000)]).tobytes() # TODO: set a proper value
-            
-            manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
-            
-            self.data_socket.send_multipart([b'max_plot_points', manual_chans_json, max_manual_mode_points])
-            response = self.data_socket.recv()
-            assert response == b'ok', response
-
-            if not self.task:
-                self.manual_mode_task = self.start_task(self.manual_mode_chans, self.manual_mode_rate)
-
+        self.stop_tasks(abort)
+        if not abort and self.wait_table is not None:
+            # Let's work out how long the waits were. The absolute times of each edge on
+            # the wait monitor were:
+            edge_times = np.cumsum(self.semiperiods)
+            # Now there was also a rising edge at t=0 that we didn't measure:
+            edge_times = np.insert(edge_times, 0, 0)
+            # Ok, and the even-indexed ones of these were rising edges.
+            rising_edge_times = edge_times[::2]
+            # Now what were the times between rising edges?
+            periods = np.diff(rising_edge_times)
+            # How does this compare to how long we expected there to be between the
+            # start of the experiment and the first wait, and then between each pair of
+            # waits? The difference will give us the waits' durations.
+            resume_times = self.wait_table['time']
+            # Again, include the start of the experiment, t=0:
+            resume_times = np.insert(resume_times, 0, 0)
+            run_periods = np.diff(resume_times)
+            wait_durations = periods - run_periods
+            waits_timed_out = wait_durations > self.wait_table['timeout']
+            # Work out how long the waits were, save them, post an event saying so:
+            dtypes = [
+                ('label', 'a256'),
+                ('time', float),
+                ('timeout', float),
+                ('duration', float),
+                ('timed_out', bool),
+            ]
+            data = np.empty(len(self.wait_table), dtype=dtypes)
+            data['label'] = self.wait_table['label']
+            data['time'] = self.wait_table['time']
+            data['timeout'] = self.wait_table['timeout']
+            data['duration'] = wait_durations
+            data['timed_out'] = waits_timed_out
+            with h5py.File(self.h5_file, 'a') as hdf5_file:
+                hdf5_file.create_dataset('/data/waits', data=data)
+            self.wait_durations_analysed.post(self.h5_file)
+        self.h5_file = None
+        self.semiperiods = None
         return True
 
     def extract_measurements(self, raw_data, waits_in_use):
