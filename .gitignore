@@ -160,3 +160,11 @@ docs/html/
 docs/source/_build/
 docs/source/components.rst
 docs/source/devices/_apidoc
+/labscript_devices/BurgersAD9959DDS
+/labscript_devices/BurgersDSISignalGenerator
+/labscript_devices/BurgersLab-RFSoC-Pulser
+/labscript_devices/BurgersMakoCamera
+/labscript_devices/BurgersMakoCameraVimba
+/labscript_devices/BurgersSmallDDS
+/labscript_devices/BurgersVaunixSignalGenerator
+/labscript_devices/BurgersTECController
