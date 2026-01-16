@@ -239,7 +239,7 @@ class PrawnBlasterWorker(Worker):
 
         return values
 
-    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, table_data=None):
         """Configures the PrawnBlaster for buffered execution.
 
         Args:

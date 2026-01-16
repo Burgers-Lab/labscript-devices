@@ -329,7 +329,7 @@ class NI_DAQmxOutputWorker(Worker):
 
         return final_values
 
-    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
         # Store the initial values in case we have to abort and restore them:
         self.initial_values = initial_values
 
@@ -591,7 +591,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
                 self.task = None
                 self.read_array = None
 
-    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
         self.logger.debug('transition_to_buffered')
 
         # read channels, acquisition rate, etc from H5 file
@@ -1005,7 +1005,7 @@ class NI_DAQmxWaitMonitorWorker(Worker):
                 1, True, 1, DAQmx_Val_GroupByChannel, self.timeout_rearm, written, None
             )
 
-    def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
         self.logger.debug('transition_to_buffered')
         self.h5_file = h5file
         with h5py.File(h5file, 'r') as hdf5_file:
