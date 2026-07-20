@@ -6,6 +6,50 @@ program on an RFSoC board over Pyro4, as part of a labscript shot. Supports two 
 `trigger_mode='hardware'` (a real compiled trigger pulse gates the tProc's own external-start
 input). See the root repo README for full details, including hardware-trigger wiring.
 
+## Moving to a different board (or a new/reflashed one) -- checklist
+
+This device has previously been pointed at the wrong board's settings without any obvious error
+until the shot actually ran (or, worse, until the board's FPGA manager wedged itself). Everything
+below must agree with the *actual physical board* you're talking to -- check all of it after
+swapping boards, re-imaging one, or copying a connection table between setups.
+
+1. **`ns_host` / `ssh_host` (the board's static IP)** -- set in the `QICKBoard(...)` connection
+   table entry. Verify with `ping <ip>` and, if `auto_setup` is used, that SSH actually logs in
+   (`ssh xilinx@<ip>`).
+2. **The bitstream in `pyro4/pyro_service.py` on the board itself must match the board model.**
+   `amo_qick/qick_lib/qick/` ships one `.bit`/`.hwh` pair per board (e.g. `qick_4x2.bit` for an
+   RFSoC4x2, `qick_216.bit` for a ZCU216) -- `pyro_service.py`'s `bitfile` variable is a hardcoded
+   relative path and does **not** auto-detect which board it's running on. Loading the wrong one
+   doesn't fail cleanly: it can throw `OSError: [Errno 12] Cannot allocate memory` out of PYNQ's
+   `Overlay.download()`, and leave `/sys/class/fpga_manager/fpga0/state` stuck in `write error`
+   (check with `cat` over SSH) until the next successful download self-heals it or the board is
+   rebooted. Confirm the real board model first with `cat /proc/device-tree/model` over SSH, then
+   match the bitfile to it.
+3. **`ns_host` inside that same `pyro_service.py` must be `'0.0.0.0'`, not the default
+   `'localhost'`.** With `'localhost'`, the process starts and *looks* fine locally (`ps`/`ss` show
+   it listening on `8000`) but is only reachable from the board itself -- the BLACS PC's
+   `Pyro4.locateNS()` will just time out. The file's own comment calls this out; it's easy to miss.
+4. **`proxy_name`** in the connection table must match the `proxy_name` set in that same
+   `pyro_service.py` on the board (both default to values like `'rfsoc'`/`'myqick'`, but they're
+   independent strings that must be typed identically on both sides).
+5. **`board_model`** (informational) and, if using `auto_setup`, **`board_env_name`** (the `BOARD`
+   environment variable auto_setup exports before launching, e.g. `'ZCU216'`) should both reflect
+   the real board.
+6. **`remote_qick_repo_path`** (if using `auto_setup`) must be the actual path to a qick/amo_qick
+   checkout *on that board's filesystem* -- boards may have more than one checkout present (e.g.
+   both `~/jupyter_notebooks/qick` and `~/jupyter_notebooks/amo_qick`); point at the one you
+   actually want running, and remember `pyro_service.py`'s fixes in point 2/3 above need making in
+   whichever one you pick.
+7. **QICK library version** on the board vs. the version pip-installed in the BLACS venv. A
+   mismatch doesn't block the connection but logs a `QICK library version mismatch` warning from
+   `qick.pyro.make_proxy()` and can cause a `KeyError` during `QickConfig` initialization later --
+   if you see that, this is the first thing to check (`pip show qick` locally vs. the board's
+   installed version).
+8. **SSH credentials** for `auto_setup` -- `ssh_user` (connection table) and the
+   `QICK_BOARD_SSH_PASSWORD` environment variable (set in BLACS's own environment, not the
+   connection table) must be correct for the new board; PYNQ images default to `xilinx`/`xilinx`
+   but this isn't guaranteed across boards.
+
 ## Install into a labscript-suite environment
 
 1. Copy this `QICKBoard/` folder into your labscript profile's `user_devices` directory (the path
@@ -22,9 +66,11 @@ input). See the root repo README for full details, including hardware-trigger wi
    its worker subprocesses (BLACS spawns workers via its own process-launching mechanism, not
    simple inheritance). If you rely on this fallback, verify it actually reaches the worker (check
    for `ModuleNotFoundError: No module named 'qick'` in BLACS's log) rather than assuming it works.
-3. On the RFSoC board itself, a Pyro4 nameserver + QICK proxy server must already be running and
-   reachable over the network -- see `../board_setup/setup_qick_board.sh` in this repo to set
-   that up on a new board.
+3. On the RFSoC board itself, a Pyro4 nameserver + QICK proxy server must be running and reachable
+   over the network -- see `../board_setup/setup_qick_board.sh` in this repo to set that up on a
+   new board (one time). After that, pass `auto_setup=True` (see below) and BLACS will bring the
+   server back up itself on every startup if it's ever down, instead of needing that as a repeated
+   manual step. `auto_setup=True` needs `pip install paramiko` in the BLACS environment.
 
 ## Connection table usage
 
@@ -46,12 +92,38 @@ qick_board = QICKBoard(
 In your experiment script:
 
 ```python
-qick_board.start_tproc(t=0.5)  # metadata only in this MVP -- see Limitations
+qick_board.start_tproc(t=0.5)  # metadata only in software mode -- see root README
 ```
 
 `tproc_program_module`/`tproc_program_class` must name an importable `QickProgram`/
 `AveragerProgram` subclass, resolved inside the BLACS worker process via
-`labscript_utils.device_registry.import_class_by_fullname`.
+`labscript_utils.device_registry.import_class_by_fullname`. Works for tProc v1 and v2 program
+classes alike, since `run()` (which the worker calls) is defined once on a shared base class.
+
+To track `tproc_program_kwargs` values as runmanager globals instead of fixing them in the
+connection table, omit that argument from the constructor and call
+`qick_board.set_tproc_program_kwargs({...})` from your experiment script instead (values sourced
+from runmanager globals). See the root README's "Tracking pulse parameters as runmanager globals"
+section -- there's a real gotcha around *where* you do this if the same file is also BLACS's own
+connection table.
+
+## Auto-setup (no manual SSH step before starting BLACS)
+
+```python
+qick_board = QICKBoard(
+    name='qick_board', ns_host=..., ns_port=..., proxy_name=..., board_model=...,
+    auto_setup=True, ssh_user='xilinx', board_env_name='RFSoC4x2',
+    remote_qick_repo_path='/home/xilinx/jupyter_notebooks/amo_qick',
+    ...
+)
+```
+
+The worker's `init()` checks whether the board's server is reachable and, if not, SSHes in (via
+`paramiko`) and launches it automatically. Set `QICK_BOARD_SSH_PASSWORD` in BLACS's environment
+before starting it -- deliberately not a connection-table property, since that would land in
+every compiled shot's HDF5 file. Verified end-to-end through a real BLACS startup with the board's
+server intentionally killed beforehand: ~20s to detect, launch, and connect, with zero other
+manual steps. See the root README for the fuller writeup.
 
 ## Limitations (by design, this pass)
 
@@ -64,5 +136,5 @@ qick_board.start_tproc(t=0.5)  # metadata only in this MVP -- see Limitations
   program to finish or pull back acquired data -- QICK/Pyro4 has no blocking "done" RPC. Both are
   planned follow-ups (a WaitMonitor-based hardware loopback, and a `transition_to_manual`
   extension modeled on `IMAQdxCamera`'s image-saving pattern, respectively).
-- **One fixed program per connection table entry.** No per-shot program/parameter selection via
-  runmanager globals yet.
+- **The program module/class itself is still fixed per connection table entry** -- only its
+  keyword-argument values can be tracked as runmanager globals, not which program class runs.
