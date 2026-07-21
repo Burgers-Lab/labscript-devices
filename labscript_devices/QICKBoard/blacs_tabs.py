@@ -1,5 +1,6 @@
 from blacs.device_base_class import DeviceTab
 from blacs.tab_base_classes import define_state, MODE_MANUAL
+from qtutils import inmain_decorator
 from qtutils.qt import QtWidgets, QtGui
 
 from labscript_devices.QICKBoard.manual_programs import (
@@ -84,7 +85,14 @@ class QICKBoardTab(DeviceTab):
         )
         self.primary_worker = "main_worker"
 
+    @inmain_decorator()
     def _show_result(self, result):
+        # Called from _run_manual_program/_stop_manual_program's @define_state
+        # generators, after their yield -- that continuation runs on BLACS's
+        # tab state-machine thread, not reliably the Qt GUI thread, so widget
+        # access here must be marshalled via inmain_decorator (matching
+        # IMAQdxCameraTab.update_text_slot's identical pattern) rather than
+        # called directly.
         self.manual_output.setPlainText(f"{result['status']}\n\n{result['soc_info']}")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(True)
