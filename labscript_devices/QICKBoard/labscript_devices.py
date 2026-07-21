@@ -28,6 +28,17 @@ class QICKBoard(TriggerableDevice):
                 "ns_host", "ns_port", "proxy_name", "board_model", "trigger_mode",
                 "auto_setup", "ssh_host", "ssh_user", "board_env_name",
                 "remote_qick_repo_path", "pynq_venv_path",
+                # NOTE: tproc_program_module/class/kwargs deliberately do NOT
+                # also live here. labscript/labscript.py's
+                # generate_connection_table() builds the connection table's
+                # comparison "properties" column exclusively from
+                # connection_table_properties -- if these were listed here
+                # too, two shots with different set_tproc_program() values
+                # would get different connection-table snapshots and BLACS
+                # would reject the second as "not a subset of the
+                # experimental control apparatus" (confirmed the hard way).
+                # device_properties below is the only correct location for
+                # values meant to vary per shot.
             ],
             "device_properties": [
                 "tproc_program_module", "tproc_program_class", "tproc_program_kwargs",
@@ -57,9 +68,14 @@ class QICKBoard(TriggerableDevice):
                 the board's PMOD1 pin 0 (external tProc start input).
             connection (str, optional): required if trigger_mode is 'hardware' -- the
                 connection string (e.g. 'port0/line1') on parent_device to use.
-            tproc_program_module (str): dotted module path containing the QickProgram
-                subclass to run (importable from the BLACS worker process)
-            tproc_program_class (str): name of the QickProgram subclass within that module
+            tproc_program_module (str, optional): dotted module path containing the
+                QickProgram subclass to run (importable from the BLACS worker
+                process). May be left unset here and provided per-shot instead via
+                set_tproc_program() -- see that method's docstring. If still unset
+                by the time a shot actually runs, transition_to_buffered() raises
+                a clear RuntimeError.
+            tproc_program_class (str, optional): name of the QickProgram subclass
+                within that module. Same optionality as tproc_program_module above.
             tproc_program_kwargs (dict, optional): kwargs passed to the program's cfg dict
             auto_setup (bool): if True, the BLACS worker checks whether the board's
                 Pyro4 server is reachable during init(), and if not, SSHes in and
@@ -81,10 +97,6 @@ class QICKBoard(TriggerableDevice):
             pynq_venv_path (str): path to the PYNQ venv on the board. Default
                 '/usr/local/share/pynq-venv' (standard PYNQ image location).
         """
-        if tproc_program_module is None or tproc_program_class is None:
-            raise LabscriptError(
-                f"QICKBoard {name}: tproc_program_module and tproc_program_class are required"
-            )
         if trigger_mode not in ("software", "hardware"):
             raise LabscriptError(
                 f"QICKBoard {name}: trigger_mode must be 'software' or 'hardware', "
@@ -121,6 +133,32 @@ class QICKBoard(TriggerableDevice):
             TriggerableDevice.__init__(self, name, None, None, parentless=True, **kwargs)
         else:
             TriggerableDevice.__init__(self, name, parent_device, connection, **kwargs)
+
+    def set_tproc_program(self, tproc_program_module, tproc_program_class, tproc_program_kwargs=None):
+        """Override this shot's tProc program -- which module/class runs, and
+        optionally its full cfg -- instead of fixing a specific script in the
+        connection table.
+
+        Call this from your experiment script's __main__ block (guarded, not
+        the connection table's own smoke test -- see set_tproc_program_kwargs()'s
+        docstring for why), with tproc_program_module/tproc_program_class as bare
+        runmanager global names so which script actually ran gets tracked
+        per-shot, the same way set_tproc_program_kwargs() already tracks cfg
+        values. Must be called *after* construction but *before* stop(), for
+        the same frozen-snapshot reason documented there.
+        """
+        self.tproc_program_module = tproc_program_module
+        self.tproc_program_class = tproc_program_class
+        self.set_property(
+            "tproc_program_module", tproc_program_module,
+            location="device_properties", overwrite=True,
+        )
+        self.set_property(
+            "tproc_program_class", tproc_program_class,
+            location="device_properties", overwrite=True,
+        )
+        if tproc_program_kwargs is not None:
+            self.set_tproc_program_kwargs(tproc_program_kwargs)
 
     def set_tproc_program_kwargs(self, tproc_program_kwargs):
         """Override this shot's tProc program cfg dict.

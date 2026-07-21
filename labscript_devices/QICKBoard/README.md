@@ -52,9 +52,11 @@ swapping boards, re-imaging one, or copying a connection table between setups.
 
 ## Install into a labscript-suite environment
 
-1. Copy this `QICKBoard/` folder into your labscript profile's `user_devices` directory (the path
-   your labconfig's `user_devices` setting points at, typically
-   `<labscript-suite>/userlib/user_devices/QICKBoard/`).
+1. Make sure the BLACS venv's `labscript_devices` package is this repo (or a fork of it) containing
+   this `QICKBoard/` folder -- e.g. `pip install -e /path/to/this/labscript-devices` checkout. This
+   device's own `register_classes.py`/`blacs_tabs.py` reference `labscript_devices.QICKBoard...`
+   (not a separate `user_devices` copy), so it must actually be part of the installed
+   `labscript_devices` package, not copied elsewhere on `sys.path` under a different top-level name.
 2. Make sure `qick` is importable in that Python environment: `pip install -e /path/to/your/qick`
    (a clone of `openquantumhardware/qick` or a fork -- must contain a `qick_lib/` directory and a
    `setup.py`) into the same venv BLACS runs in. This is the reliable option.
@@ -75,7 +77,7 @@ swapping boards, re-imaging one, or copying a connection table between setups.
 ## Connection table usage
 
 ```python
-from user_devices.QICKBoard.labscript_devices import QICKBoard
+from labscript_devices.QICKBoard.labscript_devices import QICKBoard
 
 qick_board = QICKBoard(
     name='qick_board',

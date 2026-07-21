@@ -151,6 +151,13 @@ class QICKBoardWorker(Worker):
         with h5py.File(h5file, "r") as f:
             props = properties.get(f, device_name, "device_properties")
 
+        if props["tproc_program_module"] is None or props["tproc_program_class"] is None:
+            raise RuntimeError(
+                f"{device_name}: no tProc program configured for this shot -- call "
+                "qick_board.set_tproc_program(module, class_name, kwargs) from your "
+                "experiment script (with runmanager globals for the module/class "
+                "you want this shot to use) before stop()."
+            )
         cls = import_class_by_fullname(
             f"{props['tproc_program_module']}.{props['tproc_program_class']}"
         )
@@ -163,6 +170,66 @@ class QICKBoardWorker(Worker):
         start_src = "external" if self.trigger_mode == "hardware" else "internal"
         prog.run(self.soc, load_prog=True, load_envelopes=True, start_src=start_src)
         return {}
+
+    def _read_connection_table_program(self):
+        """Read tproc_program_module/class/kwargs fresh from the currently
+        loaded connection table's own compiled HDF5 file -- these live only in
+        device_properties (can vary per shot via set_tproc_program()), not in
+        the connection_table_properties passed to this worker at init(), so
+        they can't be cached as instance attributes here. Always reflects
+        whatever the connection table's own QICKBoard(...) construction
+        currently specifies (None/None/{} if it specifies nothing)."""
+        import labscript_utils.labconfig
+        connection_table_h5 = labscript_utils.labconfig.LabConfig().get(
+            "paths", "connection_table_h5"
+        )
+        with h5py.File(connection_table_h5, "r") as f:
+            props = properties.get(f, self.device_name, "device_properties")
+        return (
+            props["tproc_program_module"], props["tproc_program_class"],
+            props["tproc_program_kwargs"],
+        )
+
+    def run_manual_program(self, program_key):
+        """Run a program immediately, independent of any labscript shot --
+        for BLACS's "Manual Program Control" panel. Always start_src="internal"
+        -- a manual GUI click is an immediate local action, not something that
+        should wait on trigger_mode='hardware''s external pulse.
+
+        Returns a dict with a status message and the board's own str(soccfg)
+        hardware report -- self.soc is just a Pyro4 proxy (str(soc) only gives
+        a generic proxy repr), self.soccfg is the real local QickConfig with
+        the board's actual description -- so the GUI can show both that the
+        RFSoC actually received the program and which hardware it's running on.
+        """
+        from labscript_devices.QICKBoard.manual_programs import (
+            MANUAL_PROGRAMS, CONNECTION_TABLE_PROGRAM,
+        )
+
+        if program_key == CONNECTION_TABLE_PROGRAM:
+            module, class_name, kwargs = self._read_connection_table_program()
+            if module is None or class_name is None:
+                raise RuntimeError(
+                    f"{self.device_name}: no tProc program is configured in the "
+                    "connection table -- pick a registered debug program instead, "
+                    "or set one via qick_board.set_tproc_program(...) in an "
+                    "experiment script and submit a shot first."
+                )
+            cls = import_class_by_fullname(f"{module}.{class_name}")
+            label = class_name
+        else:
+            cls, kwargs = MANUAL_PROGRAMS[program_key]
+            label = program_key
+
+        prog = cls(self.soccfg, kwargs)
+        prog.run(self.soc, load_prog=True, load_envelopes=True, start_src="internal")
+        return {"status": f"Started {label!r}.", "soc_info": str(self.soccfg)}
+
+    def stop_manual_program(self):
+        """Reset the board's generators (kills any continuous/periodic output
+        left running by run_manual_program()), for the "Stop" button."""
+        self.soc.reset_gens()
+        return {"status": "Outputs reset.", "soc_info": str(self.soccfg)}
 
     def transition_to_manual(self):
         return True
