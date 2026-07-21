@@ -76,6 +76,11 @@ swapping boards, re-imaging one, or copying a connection table between setups.
 
 ## Connection table usage
 
+See `connection_table_example.py` in this folder for two complete, copy-pasteable patterns
+(minimal software-trigger, and full hardware-trigger + auto_setup + a production/test board
+toggle) -- both verified importable as-is, just replace the placeholder IP/COM-port/paths with
+your own values.
+
 ```python
 from labscript_devices.QICKBoard.labscript_devices import QICKBoard
 
@@ -102,12 +107,13 @@ qick_board.start_tproc(t=0.5)  # metadata only in software mode -- see root READ
 `labscript_utils.device_registry.import_class_by_fullname`. Works for tProc v1 and v2 program
 classes alike, since `run()` (which the worker calls) is defined once on a shared base class.
 
-To track `tproc_program_kwargs` values as runmanager globals instead of fixing them in the
-connection table, omit that argument from the constructor and call
-`qick_board.set_tproc_program_kwargs({...})` from your experiment script instead (values sourced
-from runmanager globals). See the root README's "Tracking pulse parameters as runmanager globals"
-section -- there's a real gotcha around *where* you do this if the same file is also BLACS's own
-connection table.
+**Both are optional** -- omit them from the constructor entirely and the connection table doesn't
+need to hardcode a specific script at all. Call `qick_board.set_tproc_program(tproc_program_module,
+tproc_program_class, {...})` from your experiment script instead (all three bare runmanager global
+names), so *which* program runs -- not just its kwargs -- is chosen per-shot. To track only the
+kwargs while keeping the module/class fixed, call `qick_board.set_tproc_program_kwargs({...})`
+instead. See the root README's "Tracking pulse parameters as runmanager globals" section -- there's
+a real gotcha around *where* you do this if the same file is also BLACS's own connection table.
 
 ## Auto-setup (no manual SSH step before starting BLACS)
 
@@ -129,8 +135,13 @@ manual steps. See the root README for the fuller writeup.
 
 ## Limitations (by design, this pass)
 
-- **`trigger_mode` is fixed per connection table, not per shot** -- read once at BLACS tab-init
-  time, not re-read from each submitted shot's file.
+- **`trigger_mode`, `auto_setup`, `board_env_name`, `remote_qick_repo_path`, etc. are still fixed
+  per connection table entry, not per shot** -- read once at BLACS tab-init time. These are
+  `connection_table_properties`, part of the connection table's own structural comparison: a shot
+  whose values differ from BLACS's currently loaded connection table is rejected as "not a subset
+  of the experimental control apparatus." Only `tproc_program_module`/`tproc_program_class`/
+  `tproc_program_kwargs` (`device_properties`) can vary per shot, via `set_tproc_program()`/
+  `set_tproc_program_kwargs()`.
 - **Hardware-trigger mode's actual trigger detection is unverified over a real wire** -- confirmed
   the worker arms correctly and the shot compiles/runs, but not confirmed with a scope that the
   physical rising edge is actually detected and the resulting latency. See root README.
@@ -138,5 +149,3 @@ manual steps. See the root README for the fuller writeup.
   program to finish or pull back acquired data -- QICK/Pyro4 has no blocking "done" RPC. Both are
   planned follow-ups (a WaitMonitor-based hardware loopback, and a `transition_to_manual`
   extension modeled on `IMAQdxCamera`'s image-saving pattern, respectively).
-- **The program module/class itself is still fixed per connection table entry** -- only its
-  keyword-argument values can be tracked as runmanager globals, not which program class runs.
