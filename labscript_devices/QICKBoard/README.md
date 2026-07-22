@@ -108,12 +108,17 @@ qick_board.start_tproc(t=0.5)  # metadata only in software mode -- see root READ
 classes alike, since `run()` (which the worker calls) is defined once on a shared base class.
 
 **Both are optional** -- omit them from the constructor entirely and the connection table doesn't
-need to hardcode a specific script at all. Call `qick_board.set_tproc_program(tproc_program_module,
-tproc_program_class, {...})` from your experiment script instead (all three bare runmanager global
-names), so *which* program runs -- not just its kwargs -- is chosen per-shot. To track only the
-kwargs while keeping the module/class fixed, call `qick_board.set_tproc_program_kwargs({...})`
-instead. See the root README's "Tracking pulse parameters as runmanager globals" section -- there's
-a real gotcha around *where* you do this if the same file is also BLACS's own connection table.
+need to hardcode a specific script at all. Call `qick_board.set_tproc_program(tproc_program, {...})`
+from your experiment script instead, passing the actual class or a *factory callable* -- a function
+taking a single cfg dict and returning a QickProgram subclass with that cfg baked in (e.g.
+qick_programs.py's `InterleavedDrive`) -- so *which* program runs is chosen per-shot rather than
+fixed in the connection table. `set_tproc_program` derives the dotted module/class name from the
+passed object's `__module__`/`__qualname__` for storage in the shot's HDF5 file; the worker
+re-imports it by that name and, via `inspect.isclass()`, either instantiates it directly or calls
+it first (with `tproc_program_kwargs`) if it's a factory. To track only the kwargs while keeping
+the module/class fixed, call `qick_board.set_tproc_program_kwargs({...})` instead. See the root
+README's "Tracking pulse parameters as runmanager globals" section -- there's a real gotcha around
+*where* you do this if the same file is also BLACS's own connection table.
 
 ## Auto-setup (no manual SSH step before starting BLACS)
 

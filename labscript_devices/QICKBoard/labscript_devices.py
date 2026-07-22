@@ -134,19 +134,31 @@ class QICKBoard(TriggerableDevice):
         else:
             TriggerableDevice.__init__(self, name, parent_device, connection, **kwargs)
 
-    def set_tproc_program(self, tproc_program_module, tproc_program_class, tproc_program_kwargs=None):
-        """Override this shot's tProc program -- which module/class runs, and
+    def set_tproc_program(self, tproc_program, tproc_program_kwargs=None):
+        """Override this shot's tProc program -- which class/factory runs, and
         optionally its full cfg -- instead of fixing a specific script in the
         connection table.
 
+        tproc_program: the actual QickProgram/AveragerProgram subclass to run,
+        OR a factory callable that takes a single cfg dict and returns such a
+        subclass (e.g. qick_programs.py's InterleavedDrive, which closes over
+        its cfg inside a dynamically-defined class rather than reading
+        self.cfg). Only __module__/__qualname__ get written into the shot's
+        HDF5 device_properties (tproc_program_module/tproc_program_class,
+        unchanged keys) -- the BLACS worker process only ever reads the
+        compiled HDF5 file, so it re-imports by that dotted name and, via
+        inspect.isclass(), either instantiates directly or calls the factory
+        first with tproc_program_kwargs. See blacs_workers.py's
+        _resolve_tproc_program_class() for the worker-side half of this
+        contract.
+
         Call this from your experiment script's __main__ block (guarded, not
         the connection table's own smoke test -- see set_tproc_program_kwargs()'s
-        docstring for why), with tproc_program_module/tproc_program_class as bare
-        runmanager global names so which script actually ran gets tracked
-        per-shot, the same way set_tproc_program_kwargs() already tracks cfg
-        values. Must be called *after* construction but *before* stop(), for
-        the same frozen-snapshot reason documented there.
+        docstring for why). Must be called *after* construction but *before*
+        stop(), for the same frozen-snapshot reason documented there.
         """
+        tproc_program_module = tproc_program.__module__
+        tproc_program_class = tproc_program.__qualname__
         self.tproc_program_module = tproc_program_module
         self.tproc_program_class = tproc_program_class
         self.set_property(

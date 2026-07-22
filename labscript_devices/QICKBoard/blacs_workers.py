@@ -12,6 +12,7 @@ board_setup/setup_qick_board.sh's launch step (not its one-time qick-package
 install step) automatically, so getting the board's server running doesn't
 need to be a separate manual step before BLACS starts.
 """
+import inspect
 import os
 import sys
 import time
@@ -25,6 +26,18 @@ if _qick_lib_path and _qick_lib_path not in sys.path:
     sys.path.insert(0, _qick_lib_path)
 
 from blacs.tab_base_classes import Worker
+
+
+def _resolve_tproc_program_class(fullname, kwargs):
+    """Resolve a dotted tproc_program_module.tproc_program_class name to an
+    instantiable QickProgram/AveragerProgram subclass. If the imported
+    object is already a class (inspect.isclass), return it as-is. Otherwise
+    treat it as a factory callable (e.g. InterleavedDrive) and call it with
+    kwargs (or {}) to obtain the real class."""
+    obj = import_class_by_fullname(fullname)
+    if inspect.isclass(obj):
+        return obj
+    return obj(kwargs or {})
 
 
 class QICKBoardWorker(Worker):
@@ -154,12 +167,13 @@ class QICKBoardWorker(Worker):
         if props["tproc_program_module"] is None or props["tproc_program_class"] is None:
             raise RuntimeError(
                 f"{device_name}: no tProc program configured for this shot -- call "
-                "qick_board.set_tproc_program(module, class_name, kwargs) from your "
-                "experiment script (with runmanager globals for the module/class "
-                "you want this shot to use) before stop()."
+                "qick_board.set_tproc_program(tproc_program, kwargs) from your "
+                "experiment script (passing the actual program class or factory, "
+                "with kwargs sourced from runmanager globals) before stop()."
             )
-        cls = import_class_by_fullname(
-            f"{props['tproc_program_module']}.{props['tproc_program_class']}"
+        cls = _resolve_tproc_program_class(
+            f"{props['tproc_program_module']}.{props['tproc_program_class']}",
+            props["tproc_program_kwargs"],
         )
         prog = cls(self.soccfg, props["tproc_program_kwargs"])
         # In hardware mode this arms the tProc and returns immediately -- it does
@@ -215,7 +229,7 @@ class QICKBoardWorker(Worker):
                     "or set one via qick_board.set_tproc_program(...) in an "
                     "experiment script and submit a shot first."
                 )
-            cls = import_class_by_fullname(f"{module}.{class_name}")
+            cls = _resolve_tproc_program_class(f"{module}.{class_name}", kwargs)
             label = class_name
         else:
             cls, kwargs = MANUAL_PROGRAMS[program_key]

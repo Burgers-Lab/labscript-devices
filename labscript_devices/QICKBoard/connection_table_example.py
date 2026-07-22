@@ -92,7 +92,7 @@ if EXAMPLE_PATTERN == 2:
         # runmanager globals rather than fixed in the connection table:
         #
         #   qick_board.set_tproc_program(
-        #       tproc_program_module, tproc_program_class,  # bare runmanager globals
+        #       MyTProcProgram,  # the actual class (or a factory callable), not a string
         #       {"res_ch": res_ch, "pulse_freq": pulse_freq, "pulse_gain": pulse_gain,
         #        "pulse_length_us": pulse_length_us, "res_phase": res_phase, "reps": reps},
         #   )
