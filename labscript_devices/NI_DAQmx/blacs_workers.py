@@ -335,6 +335,7 @@ class NI_DAQmxOutputWorker(Worker):
         return final_values
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
+        _perf_start = time.time()
         # Store the initial values in case we have to abort and restore them:
         self.initial_values = initial_values
 
@@ -351,8 +352,10 @@ class NI_DAQmxOutputWorker(Worker):
         self.set_connected_terminals_connected(True)
 
         # Program the output tasks and retrieve the final values of each output:
+        _perf_program_start = time.time()
         DO_final_values = self.program_buffered_DO(DO_table)
         AO_final_values = self.program_buffered_AO(AO_table)
+        _perf_program_took = time.time() - _perf_program_start
 
         final_values = {}
         final_values.update(DO_final_values)
@@ -363,9 +366,14 @@ class NI_DAQmxOutputWorker(Worker):
         if self.wait_timeout_device == self.device_name:
             final_values[self.wait_timeout_connection] = self.wait_timeout_rearm_value
 
+        self.logger.info(
+            "PERF NI_DAQmx transition_to_buffered took %.4fs (task program/start: %.4fs)"
+            % (time.time() - _perf_start, _perf_program_took)
+        )
         return final_values
     
     def post_experiment(self):
+        _perf_start = time.time()
         # Stop output tasks
         npts = uInt64()
         samples = uInt64()
@@ -402,9 +410,13 @@ class NI_DAQmxOutputWorker(Worker):
         # Remove connections between other terminals, if applicable:
         self.set_connected_terminals_connected(False)
 
+        self.logger.info(
+            "PERF NI_DAQmx post_experiment took %.4fs" % (time.time() - _perf_start)
+        )
         return True
-    
+
     def transition_to_manual(self, abort=False):
+        _perf_start = time.time()
         # If aborting, stop output tasks. And program device to manual
         if abort:
             # We did not call transition_to_manual from post_experiment, stop output 
@@ -428,6 +440,9 @@ class NI_DAQmxOutputWorker(Worker):
             # Reprogram the initial states:
             self.program_manual(self.initial_values)
 
+        self.logger.info(
+            "PERF NI_DAQmx transition_to_manual took %.4fs" % (time.time() - _perf_start)
+        )
         return True
 
     def abort_transition_to_buffered(self):

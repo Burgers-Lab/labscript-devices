@@ -256,6 +256,7 @@ class PrawnBlasterWorker(Worker):
         Returns:
             dict: Dictionary of the expected final output states.
         """
+        _perf_start = time.time()
 
         if fresh:
             self.smart_cache = {}
@@ -421,6 +422,10 @@ class PrawnBlasterWorker(Worker):
         final = {}
         for pin in self.out_pins:
             final[f"GPIO {pin:02d}"] = 0
+
+        self.logger.info(
+            "PERF PrawnBlaster transition_to_buffered took %.4fs" % (time.time() - _perf_start)
+        )
         return final
 
     def start_run(self):
@@ -463,13 +468,24 @@ class PrawnBlasterWorker(Worker):
         # set started = True
         self.started = True
 
-    def transition_to_manual(self):
-        """Transition the PrawnBlaster back to manual mode from buffered execution at
-        the end of a shot.
+    def post_experiment(self):
+        """Finalise the shot that just finished: save any wait durations, and if
+        this is a secondary pseudoclock, block until buffered execution has
+        actually completed on the device.
+
+        This runs unconditionally at the end of every shot (unlike
+        :py:meth:`transition_to_manual`, which BLACS skips when another shot is
+        already queued/repeating -- see skip_manual in device_base_class.py). The
+        work here is data finalisation and hardware-completion confirmation, not
+        anything specific to being in manual mode, so it belongs here rather than
+        in transition_to_manual: without this method, BLACS falls back to running
+        the full transition_to_manual (including a GUI update) on every shot,
+        which was costing ~100ms/shot of otherwise-skippable latency.
 
         Returns:
-            bool: `True` if transition to manual is successful.
+            bool: `True` if finalisation is successful.
         """
+        _perf_start = time.time()
 
         if self.wait_table is not None:
             with h5py.File(self.h5_file, "a") as hdf5_file:
@@ -509,6 +525,22 @@ class PrawnBlasterWorker(Worker):
                     )
                 time.sleep(0.01)
 
+        self.logger.info(
+            "PERF PrawnBlaster post_experiment took %.4fs" % (time.time() - _perf_start)
+        )
+        return True
+
+    def transition_to_manual(self):
+        """Transition the PrawnBlaster back to manual mode from buffered execution at
+        the end of a shot.
+
+        All of the actual finalisation work happens unconditionally in
+        :py:meth:`post_experiment`, which always runs first. There is nothing
+        further needed to return this device to manual mode.
+
+        Returns:
+            bool: `True` if transition to manual is successful.
+        """
         return True
 
     def shutdown(self):
