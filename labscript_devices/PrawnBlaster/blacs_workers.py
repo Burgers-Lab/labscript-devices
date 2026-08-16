@@ -239,7 +239,7 @@ class PrawnBlasterWorker(Worker):
 
         return values
 
-    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, table_data=None):
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
         """Configures the PrawnBlaster for buffered execution.
 
         Args:
@@ -248,6 +248,10 @@ class PrawnBlasterWorker(Worker):
             initial_values (dict): Dictionary of output states at start of shot
             fresh (bool): When `True`, clear the local :py:attr:`smart_cache`, forcing
                 a complete reprogramming of the output table.
+            groups (dict): If provided, BLACS's queue manager already read this
+                device's h5 group and the (global) waits table for us (see
+                QueueManager.pipeline_h5_groups_to_workers), so we don't need to open
+                the h5 file ourselves.
 
         Returns:
             dict: Dictionary of the expected final output states.
@@ -265,27 +269,30 @@ class PrawnBlasterWorker(Worker):
 
         # Get data from HDF5 file
         pulse_programs = []
-        with h5py.File(h5file, "r") as hdf5_file:
-            group = hdf5_file[f"devices/{device_name}"]
+        if groups is not None:
             for i in range(self.num_pseudoclocks):
-                pulse_programs.append(group[f"PULSE_PROGRAM_{i}"][:])
+                pulse_programs.append(groups[f"PULSE_PROGRAM_{i}"])
                 self.smart_cache.setdefault(i, [])
-            self.device_properties = labscript_utils.properties.get(
-                hdf5_file, device_name, "device_properties"
-            )
+            self.device_properties = groups["__device_properties__"]
             self.is_master_pseudoclock = self.device_properties["is_master_pseudoclock"]
 
             # waits
-            dataset = hdf5_file["waits"]
-            acquisition_device = dataset.attrs["wait_monitor_acquisition_device"]
-            timeout_device = dataset.attrs["wait_monitor_timeout_device"]
+            shared_waits = groups.get("__waits__")
+            if shared_waits is not None:
+                wait_data = shared_waits["data"]
+                acquisition_device = shared_waits["attrs"]["wait_monitor_acquisition_device"]
+                timeout_device = shared_waits["attrs"]["wait_monitor_timeout_device"]
+            else:
+                wait_data = numpy.array([])
+                acquisition_device = None
+                timeout_device = None
             if (
-                len(dataset) > 0
+                len(wait_data) > 0
                 and acquisition_device
                 == "%s_internal_wait_monitor_outputs" % device_name
                 and timeout_device == "%s_internal_wait_monitor_outputs" % device_name
             ):
-                self.wait_table = dataset[:]
+                self.wait_table = wait_data
                 self.measured_waits = numpy.zeros(len(self.wait_table))
                 self.wait_timeout = numpy.zeros(len(self.wait_table), dtype=bool)
             else:
@@ -294,6 +301,36 @@ class PrawnBlasterWorker(Worker):
                 )
                 self.measured_waits = None
                 self.wait_timeout = None
+        else:
+            with h5py.File(h5file, "r") as hdf5_file:
+                group = hdf5_file[f"devices/{device_name}"]
+                for i in range(self.num_pseudoclocks):
+                    pulse_programs.append(group[f"PULSE_PROGRAM_{i}"][:])
+                    self.smart_cache.setdefault(i, [])
+                self.device_properties = labscript_utils.properties.get(
+                    hdf5_file, device_name, "device_properties"
+                )
+                self.is_master_pseudoclock = self.device_properties["is_master_pseudoclock"]
+
+                # waits
+                dataset = hdf5_file["waits"]
+                acquisition_device = dataset.attrs["wait_monitor_acquisition_device"]
+                timeout_device = dataset.attrs["wait_monitor_timeout_device"]
+                if (
+                    len(dataset) > 0
+                    and acquisition_device
+                    == "%s_internal_wait_monitor_outputs" % device_name
+                    and timeout_device == "%s_internal_wait_monitor_outputs" % device_name
+                ):
+                    self.wait_table = dataset[:]
+                    self.measured_waits = numpy.zeros(len(self.wait_table))
+                    self.wait_timeout = numpy.zeros(len(self.wait_table), dtype=bool)
+                else:
+                    self.wait_table = (
+                        None  # This device doesn't need to worry about looking at waits
+                    )
+                    self.measured_waits = None
+                    self.wait_timeout = None
 
         # Configure clock from device properties
         clock_mode = 0

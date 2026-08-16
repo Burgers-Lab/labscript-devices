@@ -138,10 +138,15 @@ class NI_DAQmxOutputWorker(Worker):
         # TODO: return coerced/quantised values
         return {}
 
-    # TODO:OPT: Not opening the file in the experiment queue significantly speeds up the file query time
-    # need to figure out why...
-    def get_output_tables(self, h5file, device_name):
-        """Return the AO and DO tables rom the file, or None if they do not exist."""
+    def get_output_tables(self, h5file, device_name, groups=None):
+        """Return the AO and DO tables from the file, or None if they do not exist.
+        If `groups` is provided (BLACS's queue manager read it already, see
+        QueueManager.pipeline_h5_groups_to_workers), use that instead of opening the
+        h5 file ourselves -- opening it here costs real time (see the TODO this
+        replaced: "opening the file in the experiment queue significantly speeds up
+        the file query time")."""
+        if groups is not None:
+            return groups.get('AO'), groups.get('DO')
         with h5py.File(h5file, 'r') as hdf5_file:
             group = hdf5_file['devices'][device_name]
             try:
@@ -337,7 +342,7 @@ class NI_DAQmxOutputWorker(Worker):
         self.stop_tasks()
 
         # Get the data to be programmed into the output tasks:
-        AO_table, DO_table = self.get_output_tables(h5file, device_name)
+        AO_table, DO_table = self.get_output_tables(h5file, device_name, groups)
 
         # Mirror the clock terminal, if applicable:
         self.set_mirror_clock_terminal_connected(True)
@@ -435,6 +440,13 @@ class NI_DAQmxOutputWorker(Worker):
 class NI_DAQmxAcquisitionWorker(Worker):
     MAX_READ_INTERVAL = 0.2
     MAX_READ_PTS = 1000
+    # Real-time plotting via DataReceiver is not wired up on the receiving end yet
+    # (NI_DAQmxTab.DataReceiver.handler's actual plot-update calls are commented out).
+    # Until it is, every send on self.data_socket is a synchronous network round-trip
+    # (blocking on the Qt main thread on the far end, via handler's inmain_decorator)
+    # that updates nothing. Skip them so they don't cost per-shot latency; flip back to
+    # True once set_buffer/set_max_data are implemented on the receiving end.
+    ENABLE_LIVE_PLOTTING = False
 
     def init(self):
         # Create the socket to communicate with the DataReceiver for Plotting
@@ -499,8 +511,7 @@ class NI_DAQmxAcquisitionWorker(Worker):
             if self.buffered_mode:
                 # Append to the list of acquired data:
                 self.acquired_data.append(data)
-            else:
-                # TODO: Send it to the broker thingy.
+            elif self.ENABLE_LIVE_PLOTTING:
                 # TODO: is pickling the list more efficient than numpy/json?
                 # prepend data packet with the channels to unpack from raw_data_buffer
                 manual_chans_json = json.dumps(list(self.manual_mode_chans)).encode('utf-8')
@@ -595,13 +606,20 @@ class NI_DAQmxAcquisitionWorker(Worker):
         self.logger.debug('transition_to_buffered')
 
         # read channels, acquisition rate, etc from H5 file
-        with h5py.File(h5file, 'r') as f:
-            group = f['/devices/' + device_name]
-            if 'AI' not in group:
+        if groups is not None:
+            if 'AI' not in groups:
                 # No acquisition
                 return {}
-            AI_table = group['AI'][:]
-            device_properties = properties.get(f, device_name, 'device_properties')
+            AI_table = groups['AI']
+            device_properties = groups['__device_properties__']
+        else:
+            with h5py.File(h5file, 'r') as f:
+                group = f['/devices/' + device_name]
+                if 'AI' not in group:
+                    # No acquisition
+                    return {}
+                AI_table = group['AI'][:]
+                device_properties = properties.get(f, device_name, 'device_properties')
 
         chans = [_ensure_str(c) for c in AI_table['connection']]
         # Remove duplicates and sort:
@@ -613,16 +631,17 @@ class NI_DAQmxAcquisitionWorker(Worker):
             # delay is defined in sample clock ticks, calculate in sec and save for later
             self.AI_start_delay = self.AI_start_delay_ticks*self.buffered_rate
         self.acquired_data = []
-        
-        # Configure the Buffered Mode Real Time Plotting
-        shot_length = device_properties.get('stop_time', None)
-        acq_points_per_chan = np.array([int(shot_length * self.buffered_rate)]).tobytes()
 
-        buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
+        if self.ENABLE_LIVE_PLOTTING:
+            # Configure the Buffered Mode Real Time Plotting
+            shot_length = device_properties.get('stop_time', None)
+            acq_points_per_chan = np.array([int(shot_length * self.buffered_rate)]).tobytes()
 
-        self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
-        response = self.data_socket.recv()
-        assert response == b'ok', response
+            buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
+
+            self.data_socket.send_multipart([b'max_plot_points', buffered_chans_json, acq_points_per_chan])
+            response = self.data_socket.recv()
+            assert response == b'ok', response
 
         # Stop the manual mode task if it is running and start the buffered mode task:
         if self.manual_mode_task:
@@ -641,14 +660,15 @@ class NI_DAQmxAcquisitionWorker(Worker):
         if self.buffered_chans is not None:
             self.stop_task()
 
-            # TODO: is pickling the list more efficient than numpy/json?
-            raw_data_buffer = np.concatenate(self.acquired_data).tobytes()
-            # prepend data packet with the channels to unpack from raw_data_buffer
-            buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
+            if self.ENABLE_LIVE_PLOTTING:
+                # TODO: is pickling the list more efficient than numpy/json?
+                raw_data_buffer = np.concatenate(self.acquired_data).tobytes()
+                # prepend data packet with the channels to unpack from raw_data_buffer
+                buffered_chans_json = json.dumps(list(self.buffered_chans)).encode('utf-8')
 
-            self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
-            response = self.data_socket.recv()
-            assert response == b'ok', response
+                self.data_socket.send_multipart([buffered_chans_json, raw_data_buffer])
+                response = self.data_socket.recv()
+                assert response == b'ok', response
 
         self.buffered_mode = False
         self.logger.info('processing acquired data, task stopped')
@@ -1008,14 +1028,22 @@ class NI_DAQmxWaitMonitorWorker(Worker):
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh, groups=None):
         self.logger.debug('transition_to_buffered')
         self.h5_file = h5file
-        with h5py.File(h5file, 'r') as hdf5_file:
-            dataset = hdf5_file['waits']
-            if len(dataset) == 0:
-                # There are no waits. Do nothing.
-                self.logger.debug('There are no waits, not transitioning to buffered')
-                self.wait_table = None
-                return {}
-            self.wait_table = dataset[:]
+        if groups is not None:
+            # The wait table is global (not under this device's own h5 group), but
+            # BLACS's queue manager reads it once and attaches it to every device's
+            # groups dict under '__waits__' -- see pipeline_h5_groups_to_workers.
+            shared_waits = groups.get('__waits__')
+            wait_table = shared_waits['data'] if shared_waits is not None else np.array([])
+        else:
+            with h5py.File(h5file, 'r') as hdf5_file:
+                wait_table = hdf5_file['waits'][:]
+
+        if len(wait_table) == 0:
+            # There are no waits. Do nothing.
+            self.logger.debug('There are no waits, not transitioning to buffered')
+            self.wait_table = None
+            return {}
+        self.wait_table = wait_table
 
         self.start_tasks()
 

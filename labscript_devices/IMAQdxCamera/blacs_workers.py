@@ -380,23 +380,42 @@ class IMAQdxCameraWorker(Worker):
         if self.continuous_thread is not None:
             # Pause continuous acquistion during transition_to_buffered:
             self.stop_continuous(pause=True)
-        with h5py.File(h5_filepath, 'r') as f:
-            group = f['devices'][self.device_name]
-            if not 'EXPOSURES' in group:
+
+        if groups is not None:
+            # BLACS's queue manager already read this device's h5 group for us (see
+            # pipeline_h5_groups_to_workers) -- use that instead of opening the file
+            # ourselves, which for a remote camera worker would otherwise mean
+            # reading it over the network here as well as wherever it gets read on
+            # the control PC.
+            if 'EXPOSURES' not in groups:
                 return {}
             self.h5_filepath = h5_filepath
-            self.exposures = group['EXPOSURES'][:]
+            self.exposures = groups['EXPOSURES']
             self.n_images = len(self.exposures)
-
-            # Get the camera_attributes from the device_properties
-            properties = labscript_utils.properties.get(
-                f, self.device_name, 'device_properties'
-            )
+            properties = groups['__device_properties__']
             camera_attributes = properties['camera_attributes']
             self.stop_acquisition_timeout = properties['stop_acquisition_timeout']
             self.exception_on_failed_shot = properties['exception_on_failed_shot']
             saved_attr_level = properties['saved_attribute_visibility_level']
             self.camera.exception_on_failed_shot = self.exception_on_failed_shot
+        else:
+            with h5py.File(h5_filepath, 'r') as f:
+                group = f['devices'][self.device_name]
+                if not 'EXPOSURES' in group:
+                    return {}
+                self.h5_filepath = h5_filepath
+                self.exposures = group['EXPOSURES'][:]
+                self.n_images = len(self.exposures)
+
+                # Get the camera_attributes from the device_properties
+                properties = labscript_utils.properties.get(
+                    f, self.device_name, 'device_properties'
+                )
+                camera_attributes = properties['camera_attributes']
+                self.stop_acquisition_timeout = properties['stop_acquisition_timeout']
+                self.exception_on_failed_shot = properties['exception_on_failed_shot']
+                saved_attr_level = properties['saved_attribute_visibility_level']
+                self.camera.exception_on_failed_shot = self.exception_on_failed_shot
         # Only reprogram attributes that differ from those last programmed in, or all of
         # them if a fresh reprogramming was requested:
         if fresh:
