@@ -437,12 +437,28 @@ class IMAQdxCameraWorker(Worker):
         self.acquisition_thread.start()
         return {}
 
-    def transition_to_manual(self):
+    def post_experiment(self):
+        """Finalise the shot that just finished: join the acquisition thread,
+        save acquired images to the shot h5 file, and send them to the GUI.
+
+        This runs unconditionally at the end of every shot (unlike
+        transition_to_manual, which BLACS skips when another shot is already
+        queued -- see skip_manual in device_base_class.py). Without this
+        method, BLACS falls back to running the full transition_to_manual
+        (including reprogramming the camera for manual-mode/live viewing) on
+        every single shot, exactly the same latency bug fixed for
+        PrawnBlasterWorker.post_experiment earlier -- see that method for the
+        full explanation of why this split matters."""
         if self.h5_filepath is None:
             print('No camera exposures in this shot.\n')
             return True
         assert self.acquisition_thread is not None
+        _perf_join_start = perf_counter()
         self.acquisition_thread.join(timeout=self.stop_acquisition_timeout)
+        self.logger.info(
+            'PERF %s acquisition_thread.join (%d exposures) took %.4fs'
+            % (self.device_name, len(self.exposures), perf_counter() - _perf_join_start)
+        )
         if self.acquisition_thread.is_alive():
             msg = """Acquisition thread did not finish. Likely did not acquire expected
                 number of images. Check triggering is connected/configured correctly"""
@@ -491,34 +507,66 @@ class IMAQdxCameraWorker(Worker):
                 images[(exposure['name'], exposure['frametype'])].append(image)
 
             # Save images to the HDF5 file:
+            _perf_save_start = perf_counter()
             for (name, frametype), imagelist in images.items():
                 data = imagelist[0] if len(imagelist) == 1 else np.array(imagelist)
-                print(f"Saving frame(s) {name}/{frametype}.")
                 group = image_group.require_group(name)
                 dset = group.create_dataset(
-                    frametype, data=data, dtype='uint16', compression='gzip'
+                    frametype, data=data, dtype='uint16', compression='lzf'
                 )
                 # Specify this dataset should be viewed as an image
                 dset.attrs['CLASS'] = np.string_('IMAGE')
                 dset.attrs['IMAGE_VERSION'] = np.string_('1.2')
                 dset.attrs['IMAGE_SUBCLASS'] = np.string_('IMAGE_GRAYSCALE')
                 dset.attrs['IMAGE_WHITE_IS_ZERO'] = np.uint8(0)
+            self.logger.info(
+                'PERF %s image save (h5 write, lzf compression) took %.4fs'
+                % (self.device_name, perf_counter() - _perf_save_start)
+            )
 
-        # If the images are all the same shape, send them to the GUI for display:
-        try:
-            image_block = np.stack(self.images)
-        except ValueError:
-            print("Cannot display images in the GUI, they are not all the same shape")
-        else:
-            self._send_image_to_parent(image_block)
-
-        self.images = None
+        # Sending the captured image(s) to the GUI for display is deferred to
+        # transition_to_manual (see that method's docstring) rather than done
+        # here unconditionally -- it blocks on an ack from the GUI thread
+        # (see _send_image_to_parent), which is a real, per-call cost not
+        # worth paying on every shot of a fast queued run when nobody's
+        # watching each individual frame anyway. self.images is deliberately
+        # not cleared here so it's available when transition_to_manual runs.
         self.n_images = None
         self.attributes_to_save = None
         self.exposures = None
         self.h5_filepath = None
         self.stop_acquisition_timeout = None
         self.exception_on_failed_shot = None
+        return True
+
+    def transition_to_manual(self):
+        """Reprogram the camera for manual-mode/live viewing, and send the
+        most recently captured image(s) to the GUI for display.
+
+        All per-shot finalisation that must happen every shot (saving images
+        to the h5 file, joining the acquisition thread) already happened
+        unconditionally in post_experiment, which always runs first. This
+        method only runs when this device is actually settling to manual
+        mode -- BLACS skips it when another shot is already queued (see
+        skip_manual in device_base_class.py) -- so deferring the GUI image
+        send to here means a fast queued run only pays that cost once, when
+        the queue pauses or finishes, rather than on every single shot. The
+        image displayed will be whichever shot's was most recently captured,
+        which may not be every shot's if several ran back-to-back."""
+        if self.images:
+            try:
+                image_block = np.stack(self.images)
+            except ValueError:
+                print("Cannot display images in the GUI, they are not all the same shape")
+            else:
+                _perf_send_start = perf_counter()
+                self._send_image_to_parent(image_block)
+                self.logger.info(
+                    'PERF %s _send_image_to_parent (blocks on GUI display ack) took %.4fs'
+                    % (self.device_name, perf_counter() - _perf_send_start)
+                )
+            self.images = None
+
         print("Setting manual mode camera attributes.\n")
         self.set_attributes_smart(self.manual_mode_camera_attributes)
         if self.continuous_dt is not None:
